@@ -23,11 +23,11 @@ class BasicBlock(nn.Module):
             padding=1,
             bias=False,
         )
-        self.bn1 = nn.BatchNorm2d(planes)
+        self.norm1 = nn.InstanceNorm2d(planes, affine=True)
         self.conv2 = nn.Conv2d(
             planes, planes, kernel_size=3, stride=1, padding=1, bias=False
         )
-        self.bn2 = nn.BatchNorm2d(planes)
+        self.norm2 = nn.InstanceNorm2d(planes, affine=True)
 
         self.shortcut = nn.Sequential()
         if stride != 1 or in_planes != self.expansion * planes:
@@ -39,13 +39,14 @@ class BasicBlock(nn.Module):
                     stride=stride,
                     bias=False,
                 ),
-                nn.BatchNorm2d(self.expansion * planes),
+                nn.InstanceNorm2d(self.expansion * planes, affine=True),
             )
 
     def forward(self, x):
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        out += self.shortcut(x)
+        out = F.relu(self.norm1(self.conv1(x)))
+        out = self.norm2(self.conv2(out))
+        shortcut_out = self.shortcut(x)
+        out += shortcut_out
         out = F.relu(out)
         return out
 
@@ -71,7 +72,7 @@ class SimpleResNet(nn.Module):
             padding=1,
             bias=False,
         )
-        self.bn1 = nn.BatchNorm2d(16)
+        self.norm1 = nn.InstanceNorm2d(16, affine=True)
 
         # Four stages of residual blocks
         self.layer1 = self._make_layer(
@@ -101,7 +102,7 @@ class SimpleResNet(nn.Module):
         return nn.Sequential(*layers)
 
     def forward(self, x):
-        out = F.relu(self.bn1(self.conv1(x)))
+        out = F.relu(self.norm1(self.conv1(x)))
         out = self.layer1(out)
         out = self.layer2(out)
         out = self.layer3(out)

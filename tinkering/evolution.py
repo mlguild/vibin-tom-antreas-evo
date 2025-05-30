@@ -20,7 +20,7 @@ def negative_loss_fitness_metric(
     outputs: torch.Tensor, labels: torch.Tensor
 ) -> torch.Tensor:
     """Calculates negative cross-entropy loss. Higher is better."""
-    loss = _criterion_for_loss_metric(outputs, labels)
+    loss = _criterion_for_loss_metric(outputs.float(), labels)
     return -loss
 
 
@@ -363,6 +363,101 @@ def run_one_generation(
         avg_fitness_this_gen,
         best_offspring_top_k_accuracies,
     )
+
+
+# --- Population Based Optimizer ---
+class PopulationOptimizer:
+    def __init__(
+        self,
+        population_size: int,
+        model_create_fn,  # Callable that returns a new model instance
+        mutation_strength: float,
+        device: torch.device,
+    ):
+        self.population_size = population_size
+        self.model_create_fn = model_create_fn
+        self.mutation_strength = mutation_strength
+        self.device = device
+        self.population: list[nn.Module] = self._initialize_population()
+        # For get_fitness_evaluation_fn, which needs a base model for vmap architecture
+        self.base_model_architecture_template = self.model_create_fn().to(
+            self.device
+        )
+
+        console.print(
+            f"[PopulationOptimizer] Initialized. Pop_size: {self.population_size}, MutSigma: {self.mutation_strength}"
+        )
+
+    def _initialize_population(self) -> list[nn.Module]:
+        pop = []
+        for _ in range(self.population_size):
+            pop.append(self.model_create_fn().to(self.device))
+        console.print(
+            f"[PopulationOptimizer] Initialized population of {len(pop)} model instances."
+        )
+        return pop
+
+    def generate_offspring_for_evaluation(self) -> list[nn.Module]:
+        """Creates a new list of offspring by mutating the current population."""
+        offspring_population = []
+        t_start_mutation = time.time()
+        for parent_model in self.population:
+            offspring_model = copy.deepcopy(
+                parent_model
+            )  # Stays on same device
+            with torch.no_grad():
+                for param in offspring_model.parameters():
+                    if param.requires_grad:
+                        noise = (
+                            torch.randn_like(param) * self.mutation_strength
+                        )
+                        param.add_(noise)
+            offspring_population.append(offspring_model)
+        # console.print(f"[DBG] Mutation for {len(offspring_population)} took: {time.time()-t_start_mutation:.4f}s", highlight=False)
+        return offspring_population
+
+    def update_population_with_selected_offspring(
+        self,
+        evaluated_offspring_population: list[nn.Module],
+        fitness_scores: torch.Tensor,
+    ):
+        """Updates the internal population by selecting the top N individuals from offspring."""
+        t_start_selection = time.time()
+        if not evaluated_offspring_population or fitness_scores.numel() == 0:
+            console.print(
+                "[PopulationOptimizer warning] Update attempt with empty offspring/fitness.",
+                style="yellow",
+            )
+            return
+
+        num_to_select = self.population_size
+        sorted_indices = torch.argsort(fitness_scores, descending=True)
+
+        new_population = []
+        for i in range(min(num_to_select, len(sorted_indices))):
+            winner_idx = sorted_indices[i].item()
+            new_population.append(
+                copy.deepcopy(evaluated_offspring_population[winner_idx])
+            )
+
+        if (
+            len(new_population) < self.population_size
+            and len(new_population) > 0
+        ):
+            console.print(
+                f"[PopulationOptimizer warning] Filling remaining population by duplicating best ({self.population_size - len(new_population)} times).",
+                style="yellow",
+            )
+            while len(new_population) < self.population_size:
+                new_population.append(copy.deepcopy(new_population[0]))
+        elif not new_population:
+            console.print(
+                "[PopulationOptimizer error] No individuals selected.",
+                style="red",
+            )
+            return
+        self.population = new_population
+        # console.print(f"[DBG] Selection & update took: {time.time()-t_start_selection:.4f}s", highlight=False)
 
 
 if __name__ == "__main__":

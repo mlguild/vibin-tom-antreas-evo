@@ -1,8 +1,10 @@
 import torch
-import torch.nn as nn  # For type hinting if needed, though models are created via function
+import torch.nn as nn
 import fire
 from pathlib import Path
-import itertools  # For cycling dataloader
+import itertools
+import copy
+import time
 
 from accelerate import Accelerator, DistributedType
 from accelerate.utils import set_seed
@@ -14,29 +16,15 @@ from rich.table import Table
 from rich.pretty import pprint
 
 from tinkering.datasets import get_dataloaders
-from tinkering.models import (
-    ResNet4StageCustom,
-)  # To define the model structure
+from tinkering.models import ResNet4StageCustom
 from tinkering.evolution import (
-    initialize_population,
-    run_one_generation,
+    PopulationOptimizer,
     get_fitness_evaluation_fn,
+    negative_loss_fitness_metric,
     accuracy_metric,
 )
 
 console = Console()
-
-# Fitness metric: Negative Cross-Entropy Loss (higher is better for ES)
-# Global criterion instance for the fitness metric
-_criterion_for_fitness = nn.CrossEntropyLoss()
-
-
-def negative_loss_fitness_metric(
-    outputs: torch.Tensor, labels: torch.Tensor
-) -> torch.Tensor:
-    """Calculates negative cross-entropy loss as a fitness metric."""
-    loss = _criterion_for_fitness(outputs, labels)
-    return -loss  # Higher is better
 
 
 def main(
@@ -45,36 +33,24 @@ def main(
     mutation_strength: float = 0.05,
     dataset_name: str = "cifar100",
     emnist_split: str = "byclass",
-    batch_size: int = 128,  # Batch size for fitness evaluation on each generation
+    batch_size: int = 128,
     data_dir_root: str = "./data",
     num_workers: int = 4,
     log_interval_generations: int = 1,
-    save_path: str = "./saved_es_models_accelerate",
-    model_name_prefix: str = "model_es_gen",
+    save_path: str = "./saved_pop_opt_models",
+    model_name_prefix: str = "model_pop_opt_gen",
     mixed_precision: str = "bf16",
     print_model_summary: bool = True,
     report_top_k_acc: tuple = (1, 5),
     seed: int = 42,
 ):
     """
-    Main script for image classification using EA, with Accelerate for device/precision.
+    Main script for image classification using PopulationOptimizer (mutation & truncation selection).
     """
     install_rich_traceback()
     set_seed(seed)
 
-    # --- Accelerator Setup (primarily for device and mixed_precision information) ---
-    accelerator_mixed_precision_config = mixed_precision.lower()
-    if accelerator_mixed_precision_config not in ["no", "fp16", "bf16"]:
-        console.print(
-            f"[warning]Invalid mixed_precision '{mixed_precision}'. Defaulting to 'no' (fp32)."
-        )
-        accelerator_mixed_precision_config = "no"
-
-    # We initialize Accelerator but won't prepare the population models with it directly.
-    # We use it for device context and consistent mixed precision handling for fitness eval.
-    accelerator = Accelerator(
-        mixed_precision=accelerator_mixed_precision_config
-    )
+    accelerator = Accelerator(mixed_precision=mixed_precision.lower())
     device = accelerator.device
 
     amp_dtype_for_fitness_eval = None
@@ -90,21 +66,26 @@ def main(
                     "[warning]bf16 requested but not supported. Fitness eval using fp32."
                 )
             actual_mp_used_for_fitness = "fp32"
+            amp_dtype_for_fitness_eval = None
     elif accelerator.mixed_precision == "fp16":
         amp_dtype_for_fitness_eval = torch.float16
-    # if "no" or None, amp_dtype_for_fitness_eval remains None (fp32)
+    elif (
+        accelerator.mixed_precision == "no"
+        or accelerator.mixed_precision is None
+    ):
+        amp_dtype_for_fitness_eval = None
+        actual_mp_used_for_fitness = "fp32"
 
     if isinstance(report_top_k_acc, list):
         report_top_k_acc = tuple(report_top_k_acc)
 
     if accelerator.is_main_process:
         console.rule(
-            f"[bold green]Evolutionary Algorithm ({accelerator.distributed_type}): {dataset_name.upper()} "
-            f"({emnist_split if dataset_name.lower()=='emnist' else ''}) - Fitness: Negative Loss, Eval Precision: {actual_mp_used_for_fitness.upper()}[/bold green]"
+            f"[bold green]PopulationOptimizer Training ({accelerator.distributed_type}): {dataset_name.upper()} "
+            f"({emnist_split if dataset_name.lower()=='emnist' else ''}) - Eval Precision: {actual_mp_used_for_fitness.upper()}[/bold green]"
         )
-        console.print(f"[info]Using device: {device}, Seed: {seed}")
         console.print(
-            f"[info]Num processes: {accelerator.num_processes}, Process index: {accelerator.process_index}"
+            f"[info]Device: {device}, Seed: {seed}, Pop Size: {population_size}, Mut Strength: {mutation_strength}"
         )
 
     dataset_specific_data_dir = Path(data_dir_root) / dataset_name
@@ -117,13 +98,8 @@ def main(
     save_dir = Path(save_path) / dataset_name / actual_mp_used_for_fitness
     if accelerator.is_main_process:
         save_dir.mkdir(parents=True, exist_ok=True)
-        console.print(
-            f"[info]Best models will be saved in: {save_dir.resolve()}"
-        )
 
-    # --- Dataloader (for fitness evaluation) ---
-    if accelerator.is_main_process:
-        console.print("[info]Loading dataset for fitness evaluation...")
+    # --- Dataloaders ---
     dataloader_kwargs = {
         "data_dir": str(dataset_specific_data_dir),
         "batch_size": batch_size,
@@ -135,29 +111,22 @@ def main(
     elif dataset_name.lower() == "cifar100":
         in_channels = 3
     else:
-        raise ValueError(
-            f"Unsupported dataset_name for input channels: {dataset_name}"
-        )
+        raise ValueError(f"Unsupported dataset: {dataset_name}")
 
-    # Prepare only the dataloader with accelerator for proper sharding in distributed settings
     fitness_eval_loader, _, num_classes, _ = get_dataloaders(
         dataset_name=dataset_name, **dataloader_kwargs
     )
+    # Prepare only the dataloader with accelerator for proper sharding if distributed
     fitness_eval_loader = accelerator.prepare(fitness_eval_loader)
-
-    if accelerator.is_main_process:
-        console.print(
-            f"[success]Dataset '{dataset_name}' loaded. Num classes: {num_classes}. Input Channels: {in_channels}"
-        )
     fitness_data_iterator = itertools.cycle(fitness_eval_loader)
 
-    # --- Model Creation Function ---
+    # --- Model Creation Function & Optimizer Setup ---
     def model_create_fn():
+        # Models created by optimizer will be moved to its device internally
         return ResNet4StageCustom(
             num_classes=num_classes, in_channels=in_channels
         )
 
-    # Print model summary for the base architecture
     if print_model_summary and accelerator.is_main_process:
         temp_model_for_summary = model_create_fn()
         console.rule("[bold cyan]Base Model Summary[/bold cyan]")
@@ -168,47 +137,44 @@ def main(
             p.numel() for p in temp_model_for_summary.parameters()
         )
         console.print(f"Total Parameters (per individual): {total_params:,}")
-        summary_table = Table(title="Layer Name & Shape (for one individual)")
+        summary_table = Table(title="Layer Name & Shape")
         summary_table.add_column("Layer Name", style="cyan")
         summary_table.add_column("Parameter Shape", style="magenta")
         summary_table.add_column(
             "Number of Parameters", style="green", justify="right"
         )
         for name, param in temp_model_for_summary.named_parameters():
-            summary_table.add_row(
-                name, str(list(param.shape)), f"{param.numel():,}"
-            )
+            if param.requires_grad:
+                summary_table.add_row(
+                    name, str(list(param.shape)), f"{param.numel():,}"
+                )
         console.print(summary_table)
         console.rule()
         del temp_model_for_summary
 
-    # --- Initialize Population ---
-    console.print(
-        f"[info]Initializing population of {population_size} individuals..."
-    )
-    current_population = initialize_population(
-        population_size, model_create_fn, device
+    pop_optimizer = PopulationOptimizer(
+        population_size=population_size,
+        model_create_fn=model_create_fn,
+        mutation_strength=mutation_strength,
+        device=device,
     )
 
-    # --- Fitness Evaluation Function ---
-    # This instance defines the architecture for all functional calls.
-    # It's not modified by the EA; its state is irrelevant once parameters are passed externally.
-    base_model_architecture_template = model_create_fn().to(device)
+    # Fitness evaluator uses the base_model_architecture_template from the optimizer
     fitness_evaluator = get_fitness_evaluation_fn(
-        base_model_architecture_template,
+        pop_optimizer.base_model_architecture_template,
         negative_loss_fitness_metric,
         amp_dtype=amp_dtype_for_fitness_eval,
     )
-    console.print(
-        f"[info]Fitness evaluation function (negative loss, using {actual_mp_used_for_fitness.upper()}) prepared."
-    )
+    if accelerator.is_main_process:
+        console.print(
+            f"[info]PopulationOptimizer and Fitness Evaluator prepared."
+        )
 
     # --- Evolutionary Loop ---
-    console.rule("[bold blue]Evolution Started[/bold blue]")
-    overall_best_fitness = -float("inf")  # Higher is better (negative loss)
-    overall_actual_loss_at_best_fitness = float(
-        "inf"
-    )  # Track actual loss for clarity
+    if accelerator.is_main_process:
+        console.rule("[bold blue]Evolution Started[/bold blue]")
+    overall_best_fitness = -float("inf")
+    overall_actual_loss_at_best_fitness = float("inf")
     overall_best_top1_acc = 0.0
     overall_best_top5_acc = 0.0
     overall_best_model_state_dict = None
@@ -222,41 +188,69 @@ def main(
         overall_progress.start()
 
     for gen in range(num_generations):
-        # Each process gets a shard of the batch from the prepared dataloader
+        gen_time_start = time.time()
+        # 1. Generate offspring population for evaluation
+        offspring_to_evaluate = (
+            pop_optimizer.generate_offspring_for_evaluation()
+        )
+
+        # 2. Evaluate these offspring to get fitness scores
         fitness_batch_inputs, fitness_batch_labels = next(
             fitness_data_iterator
         )
-        # No need to .to(device) here as accelerator.prepare(fitness_eval_loader) handles it.
-        fitness_data_batch_tuple = (
-            fitness_batch_inputs,
-            fitness_batch_labels,
+        fitness_data_batch_tuple = (fitness_batch_inputs, fitness_batch_labels)
+
+        fitness_scores = fitness_evaluator(
+            offspring_to_evaluate, fitness_data_batch_tuple, device
         )
 
-        (
-            next_pop,
-            best_offspring_sd,
-            gen_best_fit,
-            gen_avg_fit,
-            gen_best_offspring_accs,
-        ) = run_one_generation(
-            current_population,
-            base_model_architecture_template,
-            mutation_strength,
-            fitness_data_batch_tuple,
-            fitness_evaluator,
-            accuracy_metric,
-            device,
-            amp_dtype=amp_dtype_for_fitness_eval,
-            top_k_acc_report=report_top_k_acc,
+        # 3. Update the optimizer's internal population based on fitness
+        pop_optimizer.update_population_with_selected_offspring(
+            offspring_to_evaluate, fitness_scores
         )
-        current_population = next_pop
+
+        # 4. Log and get the best individual from the *evaluated offspring* for this generation
+        best_offspring_instance_this_gen, gen_best_fit = (
+            pop_optimizer.get_best_individual_from_evaluated_offspring(
+                offspring_to_evaluate, fitness_scores
+            )
+        )
+        gen_avg_fit = (
+            fitness_scores.mean().item()
+            if fitness_scores.numel() > 0
+            else -float("inf")
+        )
+        gen_best_offspring_accs = {k: 0.0 for k in report_top_k_acc}
+
+        if best_offspring_instance_this_gen:
+            # Evaluate accuracy of the single best offspring model from this generation
+            inputs_acc, labels_acc = fitness_data_batch_tuple
+            use_autocast_acc = (
+                amp_dtype_for_fitness_eval is not None
+                and device.type == "cuda"
+            )
+            with (
+                torch.no_grad(),
+                torch.amp.autocast(
+                    device_type=device.type,
+                    enabled=use_autocast_acc,
+                    dtype=(
+                        amp_dtype_for_fitness_eval
+                        if use_autocast_acc
+                        else torch.float32
+                    ),
+                ),
+            ):
+                outputs_best = best_offspring_instance_this_gen(inputs_acc)
+            acc_dict_tensors = accuracy_metric(
+                outputs_best, labels_acc, top_k=report_top_k_acc
+            )
+            gen_best_offspring_accs = {
+                k: v.item() for k, v in acc_dict_tensors.items()
+            }
+
         if accelerator.is_main_process and overall_progress:
             overall_progress.update(task_generations, advance=1)
-
-        # Gather metrics for logging if needed (gen_best_fit, gen_avg_fit are per-process on a data shard)
-        # For this simple EA, we'll log based on main process, but be aware this isn't globally aggregated fitness
-        # unless fitness_eval_fn itself does an accelerator.gather internally (which it doesn't currently)
-        # For a quick fix, we could wrap fitness_eval_fn call in accelerator.gather if it returned a tensor
 
         if (
             accelerator.is_main_process
@@ -264,11 +258,12 @@ def main(
         ):
             gen_actual_loss_at_best_fit = (
                 -gen_best_fit
-            )  # Convert back to actual loss for logging
+                if gen_best_fit != -float("inf")
+                else float("inf")
+            )
             gen_actual_avg_loss = (
-                -gen_avg_fit
-            )  # Convert back to actual loss for logging
-
+                -gen_avg_fit if gen_avg_fit != -float("inf") else float("inf")
+            )
             log_msg_parts = [
                 f"Gen: {gen+1}/{num_generations}",
                 f"BestFit(NegLoss): {gen_best_fit:.4f} (ActualLoss: {gen_actual_loss_at_best_fit:.4f})",
@@ -276,32 +271,34 @@ def main(
             ]
             if 1 in gen_best_offspring_accs:
                 log_msg_parts.append(
-                    f"BestAcc@1: {gen_best_offspring_accs[1]:.2f}%"
+                    f"BestAcc@1: {gen_best_offspring_accs.get(1, 0):.2f}%"
                 )
             if 5 in gen_best_offspring_accs:
                 log_msg_parts.append(
-                    f"BestAcc@5: {gen_best_offspring_accs[5]:.2f}%"
+                    f"BestAcc@5: {gen_best_offspring_accs.get(5, 0):.2f}%"
                 )
-
+            log_msg_parts.append(f"Time: {time.time()-gen_time_start:.2f}s")
             console.print(" | ".join(log_msg_parts))
 
-        if accelerator.is_main_process and gen_best_fit > overall_best_fitness:
+        if (
+            accelerator.is_main_process
+            and best_offspring_instance_this_gen
+            and gen_best_fit > overall_best_fitness
+        ):
             overall_best_fitness = gen_best_fit
-            overall_actual_loss_at_best_fitness = (
-                -overall_best_fitness
-            )  # Store the actual loss
-            overall_best_model_state_dict = best_offspring_sd
-            # Update overall best accuracies from the current best offspring
+            overall_actual_loss_at_best_fitness = -overall_best_fitness
             overall_best_top1_acc = gen_best_offspring_accs.get(1, 0.0)
             overall_best_top5_acc = gen_best_offspring_accs.get(5, 0.0)
+            overall_best_model_state_dict = copy.deepcopy(
+                best_offspring_instance_this_gen.cpu().state_dict()
+            )
 
             fname = f"{model_name_prefix}_{dataset_name}_gen_{gen+1}_fit_{overall_best_fitness:.4f}_loss_{overall_actual_loss_at_best_fitness:.4f}_acc1_{overall_best_top1_acc:.2f}_{actual_mp_used_for_fitness}.pt"
             model_save_path = save_dir / fname
             console.print(
-                f"[bold green]New best neg_loss: {overall_best_fitness:.4f} (Actual Loss: {overall_actual_loss_at_best_fitness:.4f}, Acc@1: {overall_best_top1_acc:.2f}%) at Gen {gen+1}. Saving...[/bold green]"
+                f"[bold green]New overall best neg_loss: {overall_best_fitness:.4f} (Actual Loss: {overall_actual_loss_at_best_fitness:.4f}, Acc@1: {overall_best_top1_acc:.2f}%) at Gen {gen+1}. Saving...[/bold green]"
             )
             if overall_best_model_state_dict:
-                # accelerator.save_state() is for full training state. For just model state_dict:
                 accelerator.save(
                     overall_best_model_state_dict, model_save_path
                 )
@@ -310,20 +307,21 @@ def main(
     if accelerator.is_main_process and overall_progress:
         overall_progress.stop()
 
-    console.rule("[bold green]Evolution Finished[/bold green]")
-    if overall_best_model_state_dict:
-        console.print(
-            f"Overall best fitness (neg_loss): {overall_best_fitness:.4f} (Actual Loss: {overall_actual_loss_at_best_fitness:.4f})"
-        )
-        console.print(
-            f"  Corresp. Acc@1: {overall_best_top1_acc:.2f}%, Acc@5: {overall_best_top5_acc:.2f}%"
-        )
-        final_fname = f"{model_name_prefix}_{dataset_name}_FINAL_fit_{overall_best_fitness:.4f}_loss_{overall_actual_loss_at_best_fitness:.4f}_acc1_{overall_best_top1_acc:.2f}_{actual_mp_used_for_fitness}.pt"
-        final_save_path = save_dir / final_fname
-        accelerator.save(overall_best_model_state_dict, final_save_path)
-        console.print(f"Final best model saved to: {final_save_path}")
-    else:
-        console.print("No best model saved.")
+    if accelerator.is_main_process:
+        console.rule("[bold green]Evolution Finished[/bold green]")
+        if overall_best_model_state_dict:
+            console.print(
+                f"Overall best fitness (neg_loss): {overall_best_fitness:.4f} (Actual Loss: {overall_actual_loss_at_best_fitness:.4f})"
+            )
+            console.print(
+                f"  Corresp. Acc@1: {overall_best_top1_acc:.2f}%, Acc@5: {overall_best_top5_acc:.2f}%"
+            )
+            final_fname = f"{model_name_prefix}_{dataset_name}_FINAL_fit_{overall_best_fitness:.4f}_loss_{overall_actual_loss_at_best_fitness:.4f}_acc1_{overall_best_top1_acc:.2f}_{actual_mp_used_for_fitness}.pt"
+            final_save_path = save_dir / final_fname
+            accelerator.save(overall_best_model_state_dict, final_save_path)
+            console.print(f"Final best model saved to: {final_save_path}")
+        else:
+            console.print("No best model saved.")
 
 
 if __name__ == "__main__":
