@@ -204,20 +204,18 @@ def select_top_n_offspring(
 
 def run_one_generation(
     current_population_models: list[nn.Module],
+    base_model_architecture: nn.Module,
     mutation_strength: float,
     data_batch_tuple: tuple,
-    fitness_eval_fn,  # Function from get_fitness_evaluation_fn
-    accuracy_eval_fn,  # For accuracy reporting of the best
+    fitness_eval_fn,
+    accuracy_eval_fn,
     device: torch.device,
-    amp_dtype: torch.dtype = None,  # For accuracy eval of the best
-    top_k_acc_report: tuple = (1, 5),  # For accuracy reporting of the best
+    amp_dtype: torch.dtype = None,
+    top_k_acc_report: tuple = (1, 5),
 ):
     """
     Runs one generation: mutate, evaluate fitness (neg loss), select.
-    Additionally, evaluates accuracy of the best offspring.
-
-    Returns:
-        tuple: (next_gen_pop, best_offspring_sd, best_fitness, avg_fitness, best_offspring_top_k_acc_dict)
+    Additionally, evaluates accuracy of the best offspring using functional_call.
     """
     offspring_population = apply_mutation(
         current_population_models, mutation_strength, device
@@ -237,16 +235,28 @@ def run_one_generation(
         avg_fitness_this_gen = offspring_fitness_scores.mean().item()
         best_offspring_idx = offspring_fitness_scores.argmax().item()
 
-        best_offspring_model = offspring_population[best_offspring_idx]
-        best_offspring_model.eval()
+        best_offspring_model_instance = offspring_population[
+            best_offspring_idx
+        ]
         best_offspring_state_dict = copy.deepcopy(
-            best_offspring_model.cpu().state_dict()
+            best_offspring_model_instance.cpu().state_dict()
         )
 
-        # Evaluate accuracy of the single best offspring model
-        inputs_acc, labels_acc = (
-            data_batch_tuple  # Use the same batch for this accuracy eval
+        # Prepare params and buffers for the single best model for functional_call
+        current_best_params = {
+            k: v.to(device)
+            for k, v in best_offspring_model_instance.named_parameters()
+        }
+        current_best_buffers = {
+            k: v.to(device)
+            for k, v in best_offspring_model_instance.named_buffers()
+        }
+        best_model_params_and_buffers = (
+            current_best_params,
+            current_best_buffers,
         )
+
+        inputs_acc, labels_acc = data_batch_tuple
         inputs_acc, labels_acc = inputs_acc.to(device), labels_acc.to(device)
         use_autocast_acc = amp_dtype is not None and device.type == "cuda"
         with torch.no_grad(), torch.amp.autocast(
@@ -254,9 +264,11 @@ def run_one_generation(
             enabled=use_autocast_acc,
             dtype=amp_dtype if use_autocast_acc else torch.float32,
         ):
-            outputs_best_offspring = best_offspring_model(
-                inputs_acc
-            )  # Standard forward pass for single model
+            outputs_best_offspring = functional_call(
+                base_model_architecture,
+                best_model_params_and_buffers,
+                (inputs_acc,),
+            )
 
         acc_dict_tensors = accuracy_eval_fn(
             outputs_best_offspring, labels_acc, top_k=top_k_acc_report
@@ -288,11 +300,11 @@ if __name__ == "__main__":
     install_rich_traceback()
 
     console.rule(
-        "[bold green]Testing Evolutionary Components (with Truncation Selection)[/bold green]"
+        "[bold green]Testing Evolutionary Components (Functional Acc Eval)[/bold green]"
     )
 
     # --- Setup for Test ---
-    pop_size_test = 10
+    pop_size_test = 4
     num_classes_test = 10
     mutation_strength_test = 0.1
     device_test = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -318,9 +330,9 @@ if __name__ == "__main__":
 
     # 2. Get Fitness Evaluation Function
     console.rule("2. Prepare Fitness Evaluation")
-    base_model_instance = _model_fn().to(device_test)
+    base_model_arch_instance = _model_fn().to(device_test)
     fitness_evaluator = get_fitness_evaluation_fn(
-        base_model_instance, _negative_loss_metric, amp_dtype=None
+        base_model_arch_instance, _negative_loss_metric, amp_dtype=None
     )
     console.print("Fitness evaluator (negative loss based) created.")
 
@@ -338,6 +350,7 @@ if __name__ == "__main__":
     next_pop, best_state_dict, best_fit, avg_fit, best_accs = (
         run_one_generation(
             current_population_models=current_pop,
+            base_model_architecture=base_model_arch_instance,
             mutation_strength=mutation_strength_test,
             data_batch_tuple=dummy_batch,
             fitness_eval_fn=fitness_evaluator,
@@ -363,11 +376,12 @@ if __name__ == "__main__":
     console.rule("4. Run Second Generation (sanity check)")
     current_pop = next_pop
     fitness_evaluator_test_gen2 = get_fitness_evaluation_fn(
-        base_model_instance, _negative_loss_metric, amp_dtype=None
+        base_model_arch_instance, _negative_loss_metric, amp_dtype=None
     )
     next_pop_2, best_state_dict_2, best_fit_2, avg_fit_2, best_accs_2 = (
         run_one_generation(
             current_population_models=current_pop,
+            base_model_architecture=base_model_arch_instance,
             mutation_strength=mutation_strength_test,
             data_batch_tuple=dummy_batch,
             fitness_eval_fn=fitness_evaluator_test_gen2,
@@ -392,5 +406,5 @@ if __name__ == "__main__":
     )
 
     console.rule(
-        "[bold green]Evolutionary Components Test (Truncation) Finished[/bold green]"
+        "[bold green]Evolutionary Components Test Finished[/bold green]"
     )

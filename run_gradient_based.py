@@ -5,11 +5,14 @@ import torch.optim.lr_scheduler as lr_scheduler
 import fire
 from pathlib import Path
 
+from accelerate import Accelerator, DistributedType
+from accelerate.utils import set_seed  # For reproducibility
+
 from rich.console import Console
 from rich.traceback import install as install_rich_traceback
 from rich.table import Table
-from rich.progress import Progress  # For overall progress
-from rich.pretty import pprint  # For model summary
+from rich.progress import Progress
+from rich.pretty import pprint
 
 from tinkering.datasets import get_dataloaders
 from tinkering.models import ResNet4StageCustom
@@ -27,50 +30,59 @@ def main(
     emnist_split: str = "byclass",
     data_dir_root: str = "./data",
     eval_interval_iters: int = 500,
-    log_interval_iters: int = 100,
     num_workers: int = 4,
-    save_path: str = "./saved_models",
+    save_path: str = "./saved_models_accelerate",
     model_name: str = "model.pt",
     final_lr_factor: float = 0.01,
-    dtype_str: str = "bf16",
-    print_model_summary: bool = True,  # Added flag for model summary
-    val_top_k: list[int] = (1, 5),  # CLI arg for top_k values
+    mixed_precision: str = "bf16",
+    print_model_summary: bool = True,
+    val_top_k: tuple = (1, 5),
+    seed: int = 42,
 ):
     """
-    Main training script for image classification using ResNet.
+    Main training script for image classification using ResNet, with Hugging Face Accelerate.
     """
     install_rich_traceback()
+    set_seed(seed)
+
+    # --- Accelerator Setup ---
+    accelerator_mixed_precision = mixed_precision.lower()
+    if accelerator_mixed_precision not in ["no", "fp16", "bf16"]:
+        console.print(
+            f"[warning]Invalid mixed_precision '{mixed_precision}'. Defaulting to 'no' (fp32)."
+        )
+        accelerator_mixed_precision = "no"
+
+    if (
+        accelerator_mixed_precision == "bf16"
+        and not torch.cuda.is_bf16_supported()
+    ):
+        console.print(
+            "[warning]bf16 requested but not supported on this CUDA device. Falling back to 'no' (fp32) for Accelerator."
+        )
+        accelerator_mixed_precision = "no"
+
+    if accelerator_mixed_precision == "fp16" and not torch.cuda.is_available():
+        console.print(
+            "[warning]fp16 requested but no CUDA available. Falling back to 'no' (fp32) for Accelerator."
+        )
+        accelerator_mixed_precision = "no"
+
+    accelerator = Accelerator(mixed_precision=accelerator_mixed_precision)
+    device = accelerator.device
+
+    # Convert val_top_k from list (if from Fire) to tuple
+    if isinstance(val_top_k, list):
+        val_top_k = tuple(val_top_k)
+
     console.rule(
-        f"[bold green]Starting Training: {dataset_name.upper()} ({emnist_split if dataset_name.lower()=='emnist' else ''}) - Precision: {dtype_str.upper()}[/bold green]"
+        f"[bold green]Starting Training ({accelerator.distributed_type}): {dataset_name.upper()} "
+        f"({emnist_split if dataset_name.lower()=='emnist' else ''}) - Precision: {accelerator.mixed_precision.upper() if accelerator.mixed_precision else 'FP32'}[/bold green]"
     )
-
-    # --- Setup Device and Dtype ---
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    console.print(f"[info]Using device: {device}")
-
-    amp_dtype = None
-    actual_dtype_str_used = dtype_str
-    if dtype_str.lower() == "bf16":
-        if device.type == "cuda" and torch.cuda.is_bf16_supported():
-            amp_dtype = torch.bfloat16
-            console.print("[info]Using bfloat16 for mixed precision.")
-        else:
-            console.print(
-                "[warning]bfloat16 requested but not supported on this device/PyTorch build. Falling back to float32."
-            )
-            amp_dtype = None  # Fallback to float32
-            actual_dtype_str_used = "fp32"
-    elif dtype_str.lower() == "fp16":
-        amp_dtype = torch.float16
-        console.print(
-            "[info]Using float16 for mixed precision. Consider GradScaler for stability if issues arise."
-        )
-    elif dtype_str.lower() != "fp32":
-        console.print(
-            f"[warning]Unknown dtype '{dtype_str}'. Defaulting to float32."
-        )
-        amp_dtype = None
-        actual_dtype_str_used = "fp32"
+    console.print(f"[info]Using device: {device}, Seed: {seed}")
+    console.print(
+        f"[info]Num processes: {accelerator.num_processes}, Process index: {accelerator.process_index}"
+    )
 
     # Specific data directory for the chosen dataset
     dataset_specific_data_dir = Path(data_dir_root) / dataset_name
@@ -83,14 +95,34 @@ def main(
         f"[info]Data will be loaded/stored in: {dataset_specific_data_dir.resolve()}"
     )
 
-    save_dir = Path(save_path) / dataset_name / actual_dtype_str_used
-    save_dir.mkdir(parents=True, exist_ok=True)
-    final_model_name = f"{dataset_name}_{Path(model_name).stem}_{actual_dtype_str_used}{Path(model_name).suffix}"
-    model_save_path = save_dir / final_model_name
+    save_dir = (
+        Path(save_path)
+        / dataset_name
+        / (
+            accelerator.mixed_precision
+            if accelerator.mixed_precision
+            else "fp32"
+        )
+    )
+    # Only main process should create directories and save
+    if accelerator.is_main_process:
+        save_dir.mkdir(parents=True, exist_ok=True)
+        console.print(
+            f"[info]Data source: {dataset_specific_data_dir.resolve()}"
+        )
+        console.print(
+            f"[info]Model checkpoints will be saved in: {save_dir.resolve()}"
+        )
+
+    final_model_name_stem = f"{dataset_name}_{Path(model_name).stem}_{accelerator.mixed_precision if accelerator.mixed_precision else 'fp32'}"
+    model_save_path = (
+        save_dir / f"{final_model_name_stem}{Path(model_name).suffix}"
+    )
     console.print(f"[info]Model will be saved to: {model_save_path.resolve()}")
 
     # --- Dataloaders ---
-    console.print("[info]Loading datasets...")
+    if accelerator.is_main_process:
+        console.print("[info]Loading datasets...")
     dataloader_kwargs = {
         "data_dir": str(dataset_specific_data_dir),
         "batch_size": batch_size,
@@ -109,49 +141,25 @@ def main(
     train_loader, test_loader, num_classes, _ = get_dataloaders(
         dataset_name=dataset_name, **dataloader_kwargs
     )
-    console.print(
-        f"[success]Dataset '{dataset_name}' loaded. Num classes: {num_classes}, Input Channels: {in_channels}"
-    )
+    if accelerator.is_main_process:
+        console.print(
+            f"[success]Dataset '{dataset_name}' loaded. Num classes: {num_classes}, Input Channels: {in_channels}"
+        )
 
-    # --- Model, Optimizer, Criterion ---
-    console.print(
-        "[info]Initializing model, optimizer, criterion, and LR scheduler..."
-    )
+    # --- Model, Optimizer, Criterion, Scheduler ---
+    if accelerator.is_main_process:
+        console.print(
+            "[info]Initializing model, optimizer, criterion, and LR scheduler..."
+        )
     model = ResNet4StageCustom(
         num_classes=num_classes, in_channels=in_channels
     ).to(device)
-
-    if print_model_summary:
-        console.rule("[bold cyan]Model Summary[/bold cyan]")
-        console.print(f"Model: {model.__class__.__name__}")
-        total_params = sum(p.numel() for p in model.parameters())
-        trainable_params = sum(
-            p.numel() for p in model.parameters() if p.requires_grad
-        )
-        console.print(f"Total Parameters: {total_params:,}")
-        console.print(f"Trainable Parameters: {trainable_params:,}")
-        summary_table = Table(title="Layer Name & Shape")
-        summary_table.add_column("Layer Name", style="cyan")
-        summary_table.add_column("Parameter Shape", style="magenta")
-        summary_table.add_column(
-            "Number of Parameters", style="green", justify="right"
-        )
-
-        for name, param in model.named_parameters():
-            summary_table.add_row(
-                name, str(list(param.shape)), f"{param.numel():,}"
-            )
-        console.print(summary_table)
-        # console.print("Full model structure:") # pprint can be very verbose for large models
-        # pprint(model)
-        console.rule()
 
     optimizer = optim.AdamW(
         model.parameters(), lr=lr, weight_decay=weight_decay
     )
     criterion = nn.CrossEntropyLoss()
 
-    # --- Learning Rate Scheduler ---
     # Linear decay from 1.0 to final_lr_factor over num_total_iterations
     # Ensure lambda function handles iteration counts correctly (0 to num_total_iterations-1)
     def lr_lambda_fn(current_iter):
@@ -165,64 +173,102 @@ def main(
 
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda_fn)
 
-    console.print(
-        "[success]Model, optimizer, criterion, and LR scheduler initialized."
+    if accelerator.is_main_process:
+        console.print(
+            "[success]Model, optimizer, criterion, and LR scheduler initialized."
+        )
+        console.print(f"  Optimizer: AdamW, Initial LR: {lr}")
+        console.print(
+            f"  LR Scheduler: LambdaLR (linear decay to {final_lr_factor * lr:.2e} over {num_total_iterations} iters)"
+        )
+        console.print(f"  Criterion: CrossEntropyLoss")
+
+    # --- Prepare with Accelerator ---
+    model, optimizer, train_loader, test_loader, scheduler = (
+        accelerator.prepare(
+            model, optimizer, train_loader, test_loader, scheduler
+        )
     )
-    console.print(f"  Optimizer: AdamW, Initial LR: {lr}")
-    console.print(
-        f"  LR Scheduler: LambdaLR (linear decay to {final_lr_factor * lr:.2e} over {num_total_iterations} iters)"
-    )
-    console.print(f"  Criterion: CrossEntropyLoss")
+
+    if print_model_summary and accelerator.is_main_process:
+        unwrapped_model = accelerator.unwrap_model(model)
+        console.rule("[bold cyan]Model Summary[/bold cyan]")
+        console.print(f"Model: {unwrapped_model.__class__.__name__}")
+        total_params = sum(p.numel() for p in unwrapped_model.parameters())
+        trainable_params = sum(
+            p.numel() for p in unwrapped_model.parameters() if p.requires_grad
+        )
+        console.print(f"Total Parameters: {total_params:,}")
+        console.print(f"Trainable Parameters: {trainable_params:,}")
+        summary_table = Table(title="Layer Name & Shape")
+        summary_table.add_column("Layer Name", style="cyan")
+        summary_table.add_column("Parameter Shape", style="magenta")
+        summary_table.add_column(
+            "Number of Parameters", style="green", justify="right"
+        )
+
+        for name, param in unwrapped_model.named_parameters():
+            summary_table.add_row(
+                name, str(list(param.shape)), f"{param.numel():,}"
+            )
+        console.print(summary_table)
+        # console.print("Full model structure:") # pprint can be very verbose for large models
+        # pprint(model)
+        console.rule()
+
+    if accelerator.is_main_process:
+        console.print("[success]Components prepared with Accelerator.")
 
     # --- Training Loop ---
-    console.rule(
-        f"[bold blue]Training Started ({actual_dtype_str_used.upper()})[/bold blue]"
-    )
+    if accelerator.is_main_process:
+        console.rule(
+            f"[bold blue]Training Started ({accelerator.mixed_precision.upper() if accelerator.mixed_precision else 'FP32'})[/bold blue]"
+        )
     current_iteration = 0
     best_val_top1_accuracy = 0.0  # Now specifically tracks Top-1
 
-    with Progress(console=console, transient=True) as overall_progress:
+    overall_progress = None
+    if accelerator.is_main_process:
+        overall_progress = Progress(console=console, transient=False)
         task_total_iters = overall_progress.add_task(
             "[cyan]Total Iterations", total=num_total_iterations
         )
+        overall_progress.start()
 
-        while current_iteration < num_total_iterations:
-            iters_to_run = min(
-                eval_interval_iters, num_total_iterations - current_iteration
-            )
+    while current_iteration < num_total_iterations:
+        iters_to_run = min(
+            eval_interval_iters, num_total_iterations - current_iteration
+        )
 
-            train_loss, train_acc, updated_iteration = run_train_iterations(
-                model,
-                train_loader,
-                optimizer,
-                criterion,
-                device,
-                num_train_iterations=iters_to_run,
-                current_step=current_iteration,
-                scheduler=scheduler,
-                amp_dtype=amp_dtype,
-            )
-            current_iteration = updated_iteration
+        train_loss, train_acc, updated_iteration = run_train_iterations(
+            model,
+            train_loader,
+            optimizer,
+            criterion,
+            accelerator,
+            num_train_iterations=iters_to_run,
+            current_step=current_iteration,
+            scheduler=scheduler,
+        )
+        current_iteration = updated_iteration
+        if accelerator.is_main_process and overall_progress:
             overall_progress.update(task_total_iters, advance=iters_to_run)
 
-            if (
-                current_iteration % log_interval_iters < iters_to_run
-            ):  # Log if it falls within the last segment of iters_to_run
-                if (
-                    current_iteration % eval_interval_iters == 0
-                    or current_iteration == num_total_iterations
-                ):
-                    console.print(
-                        f"Iter: {current_iteration}/{num_total_iterations} | Train Loss: {train_loss:.4f}, Train Acc@1: {train_acc:.4f} | LR: {optimizer.param_groups[0]['lr']:.2e}"
-                    )
+        if (
+            current_iteration % eval_interval_iters == 0
+            or current_iteration == num_total_iterations
+        ):
+            if accelerator.is_main_process:
+                console.print(
+                    f"Iter: {current_iteration}/{num_total_iterations} | Train Loss: {train_loss:.4f}, Train Acc@1: {train_acc:.4f} | LR: {optimizer.param_groups[0]['lr']:.2e}"
+                )
 
             # --- Validation ---
             val_loss, val_top_k_accs = run_validation(
                 model,
                 test_loader,
                 criterion,
-                device,
-                amp_dtype=amp_dtype,
+                accelerator,
                 top_k=val_top_k,
             )
 
@@ -244,16 +290,29 @@ def main(
                     f"[bold green]New best val Acc@1: {best_val_top1_accuracy:.4f}. Saving model to {model_save_path}...[/bold green]"
                 )
                 try:
-                    torch.save(model.state_dict(), model_save_path)
+                    accelerator.wait_for_everyone()
+                    unwrapped_model = accelerator.unwrap_model(model)
+                    accelerator.save(
+                        unwrapped_model.state_dict(), model_save_path
+                    )
+                    console.print(
+                        f"  Model state_dict saved to {model_save_path}"
+                    )
                 except Exception as e:
                     console.print(f"[error]Error saving model: {e}")
 
-            if current_iteration >= num_total_iterations:
-                break
+        if current_iteration >= num_total_iterations:
+            break
 
-    console.rule("[bold green]Training Finished[/bold green]")
-    console.print(f"Final model saved to: {model_save_path}")
-    console.print(f"Best validation Acc@1: {best_val_top1_accuracy:.4f}")
+    if accelerator.is_main_process and overall_progress:
+        overall_progress.stop()
+
+    if accelerator.is_main_process:
+        console.rule("[bold green]Training Finished[/bold green]")
+        console.print(
+            f"Model state_dict saved to: {model_save_path} (if best was achieved)"
+        )
+        console.print(f"Best validation Acc@1: {best_val_top1_accuracy:.4f}")
 
 
 if __name__ == "__main__":
