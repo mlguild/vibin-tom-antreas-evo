@@ -3,8 +3,10 @@ import torch.nn as nn
 from torch.func import functional_call, vmap, stack_module_state
 import copy
 import random
+import time
 
 from rich.console import Console
+from rich.pretty import pprint
 
 console = Console()
 
@@ -129,37 +131,50 @@ def get_fitness_evaluation_fn(
         data_batch_tuple: tuple,
         device: torch.device,  # device is now passed here
     ) -> torch.Tensor:
+        eval_start_time = time.time()
         if not population_models_list:
             return torch.empty(0, device=device)
 
         inputs, labels = data_batch_tuple
         inputs, labels = inputs.to(device), labels.to(device)
 
+        t0 = time.time()
         stacked_params, stacked_buffers = stack_module_state(
             population_models_list
         )
         params_and_buffers_for_vmap = (stacked_params, stacked_buffers)
+        # console.print(f"[eval_pop_batch DBG] stack_module_state took: {time.time() - t0:.4f}s")
 
         use_autocast = amp_dtype is not None and device.type == "cuda"
 
+        batched_outputs = None  # Initialize to avoid reference before assignment if loop is empty
         with torch.no_grad():
             with torch.amp.autocast(
                 device_type=device.type,
                 enabled=use_autocast,
                 dtype=amp_dtype if use_autocast else torch.float32,
             ):
+                t1 = time.time()
+                # console.print(f"[eval_pop_batch DBG] Calling vmapped_get_outputs. Input device: {inputs.device}")
+                # for p_name, p_val in params_and_buffers_for_vmap[0].items(): # Check a param device from first model
+                #     console.print(f"[eval_pop_batch DBG] Param {p_name} device: {p_val.device}")
+                #     break
                 batched_outputs = vmapped_get_outputs(
                     params_and_buffers_for_vmap, inputs
                 )
+                # console.print(f"[eval_pop_batch DBG] vmapped_get_outputs took: {time.time() - t1:.4f}s. Output shape: {batched_outputs.shape}")
 
+        t2 = time.time()
         fitness_scores = []
-        for i in range(len(population_models_list)):
-            outputs_for_model_i = batched_outputs[i]
-            fitness = fitness_metric_fn(outputs_for_model_i, labels)
-            fitness_scores.append(
-                fitness.item() if hasattr(fitness, "item") else fitness
-            )
-
+        if batched_outputs is not None:
+            for i in range(len(population_models_list)):
+                outputs_for_model_i = batched_outputs[i]
+                fitness = fitness_metric_fn(outputs_for_model_i, labels)
+                fitness_scores.append(
+                    fitness.item() if hasattr(fitness, "item") else fitness
+                )
+        # console.print(f"[eval_pop_batch DBG] Fitness calculation loop took: {time.time() - t2:.4f}s")
+        # console.print(f"[eval_pop_batch DBG] Total evaluate_population_on_batch took: {time.time() - eval_start_time:.4f}s")
         return torch.tensor(fitness_scores, device=device)
 
     return evaluate_population_on_batch
@@ -212,23 +227,32 @@ def run_one_generation(
     device: torch.device,
     amp_dtype: torch.dtype = None,
     top_k_acc_report: tuple = (1, 5),
+    gen_num: int = 0,  # For logging context
 ):
     """
     Runs one generation: mutate, evaluate fitness (neg loss), select.
     Additionally, evaluates accuracy of the best offspring using functional_call.
     """
+    gen_start_time = time.time()
+    # console.print(f"[Gen {gen_num} DBG] Starting generation.")
+
+    t0 = time.time()
     offspring_population = apply_mutation(
         current_population_models, mutation_strength, device
     )
+    # console.print(f"[Gen {gen_num} DBG] apply_mutation took: {time.time() - t0:.4f}s")
 
+    t1 = time.time()
     offspring_fitness_scores = fitness_eval_fn(
         offspring_population, data_batch_tuple, device
     )
+    # console.print(f"[Gen {gen_num} DBG] fitness_eval_fn took: {time.time() - t1:.4f}s")
 
     best_fitness_this_gen = -float("inf")
     avg_fitness_this_gen = -float("inf")
     best_offspring_state_dict = None
     best_offspring_top_k_accuracies = {k: 0.0 for k in top_k_acc_report}
+    t_acc_eval_start = time.time()
 
     if offspring_fitness_scores.numel() > 0:
         best_fitness_this_gen = offspring_fitness_scores.max().item()
@@ -276,13 +300,17 @@ def run_one_generation(
         best_offspring_top_k_accuracies = {
             k: v.item() for k, v in acc_dict_tensors.items()
         }
+    # console.print(f"[Gen {gen_num} DBG] Accuracy eval for best offspring took: {time.time() - t_acc_eval_start:.4f}s")
 
+    t_selection_start = time.time()
     num_to_select_for_next_gen = len(current_population_models)
     next_generation_population = select_top_n_offspring(
         offspring_population,
         offspring_fitness_scores,
         num_to_select_for_next_gen,
     )
+    # console.print(f"[Gen {gen_num} DBG] select_top_n_offspring took: {time.time() - t_selection_start:.4f}s")
+    # console.print(f"[Gen {gen_num} DBG] Total run_one_generation took: {time.time() - gen_start_time:.4f}s")
 
     return (
         next_generation_population,
@@ -313,14 +341,13 @@ if __name__ == "__main__":
         return ResNet4StageCustom(num_classes=num_classes_test, in_channels=1)
 
     # Using negative loss as fitness (higher is better)
-    criterion_test = nn.CrossEntropyLoss()
-
-    def _negative_loss_metric(outputs, labels):
-        loss = criterion_test(outputs, labels)
-        return -loss  # Negative loss, so higher is better
+    # criterion_test = nn.CrossEntropyLoss() # Already global in the module _criterion_for_loss_metric
+    # def _negative_loss_metric(outputs, labels): # Already global in the module
+    #     loss = _criterion_for_loss_metric(outputs, labels)
+    #     return -loss  # Negative loss, so higher is better
 
     console.print(
-        f"Test params: pop_size={pop_size_test}, mutation_strength={mutation_strength_test}, fitness=negative_loss, device={device_test}"
+        f"Test params: pop_size={pop_size_test}, mutation_strength={mutation_strength_test}, fitness=neg_loss, device={device_test}"
     )
 
     # 1. Initialize Population
@@ -331,8 +358,10 @@ if __name__ == "__main__":
     # 2. Get Fitness Evaluation Function
     console.rule("2. Prepare Fitness Evaluation")
     base_model_arch_instance = _model_fn().to(device_test)
-    fitness_evaluator = get_fitness_evaluation_fn(
-        base_model_arch_instance, _negative_loss_metric, amp_dtype=None
+    neg_loss_fitness_evaluator = get_fitness_evaluation_fn(
+        base_model_arch_instance,
+        negative_loss_fitness_metric,
+        amp_dtype=None,  # Test with fp32 for fitness eval
     )
     console.print("Fitness evaluator (negative loss based) created.")
 
@@ -347,62 +376,50 @@ if __name__ == "__main__":
 
     # 3. Run One Generation
     console.rule("3. Run One Generation")
-    next_pop, best_state_dict, best_fit, avg_fit, best_accs = (
-        run_one_generation(
-            current_population_models=current_pop,
-            base_model_architecture=base_model_arch_instance,
-            mutation_strength=mutation_strength_test,
-            data_batch_tuple=dummy_batch,
-            fitness_eval_fn=fitness_evaluator,
-            accuracy_eval_fn=accuracy_metric,
-            device=device_test,
-            amp_dtype=None,
-            top_k_acc_report=(1, 5),
-        )
+    s_time = time.time()
+    next_pop, best_sd, best_fit, avg_fit, best_accs = run_one_generation(
+        current_pop,
+        base_model_arch_instance,
+        mutation_strength_test,
+        dummy_batch,
+        neg_loss_fitness_evaluator,
+        accuracy_metric,
+        device_test,
+        amp_dtype=None,
+        top_k_acc_report=(1, 5),
+        gen_num=1,  # For debug logs inside
     )
-    console.print(f"Next generation created with {len(next_pop)} individuals.")
+    console.print(f"run_one_generation (1) took: {time.time() - s_time:.4f}s")
     console.print(
-        f"Generation - Best Fitness (Neg Loss): {best_fit:.4f}, Avg Fitness: {avg_fit:.4f}"
+        f"Next gen: {len(next_pop)} ind. BestFit(NegLoss): {best_fit:.4f}, AvgFit: {avg_fit:.4f}"
     )
-    if best_state_dict:
-        console.print(
-            f"  Best model state dict (gen 1) keys: {list(best_state_dict.keys())[:3]}"
-        )
     console.print(
-        f"Best Offspring Accuracies: Top-1: {best_accs.get(1,0):.2f}%, Top-5: {best_accs.get(5,0):.2f}%"
+        f"Best Offspring Accs: Top-1: {best_accs.get(1,0):.2f}%, Top-5: {best_accs.get(5,0):.2f}%"
     )
+    if best_sd:
+        console.print(f"  Best model SD keys: {list(best_sd.keys())[:3]}")
 
-    # --- Test a second generation ---
     console.rule("4. Run Second Generation (sanity check)")
     current_pop = next_pop
-    fitness_evaluator_test_gen2 = get_fitness_evaluation_fn(
-        base_model_arch_instance, _negative_loss_metric, amp_dtype=None
+    s_time = time.time()
+    next_pop_2, _, best_fit_2, avg_fit_2, best_accs_2 = run_one_generation(
+        current_pop,
+        base_model_arch_instance,
+        mutation_strength_test,
+        dummy_batch,
+        neg_loss_fitness_evaluator,
+        accuracy_metric,
+        device_test,
+        amp_dtype=None,
+        top_k_acc_report=(1, 5),
+        gen_num=2,  # For debug logs inside
     )
-    next_pop_2, best_state_dict_2, best_fit_2, avg_fit_2, best_accs_2 = (
-        run_one_generation(
-            current_population_models=current_pop,
-            base_model_architecture=base_model_arch_instance,
-            mutation_strength=mutation_strength_test,
-            data_batch_tuple=dummy_batch,
-            fitness_eval_fn=fitness_evaluator_test_gen2,
-            accuracy_eval_fn=accuracy_metric,
-            device=device_test,
-            amp_dtype=None,
-            top_k_acc_report=(1, 5),
-        )
+    console.print(f"run_one_generation (2) took: {time.time() - s_time:.4f}s")
+    console.print(
+        f"Gen 2 - BestFit(NegLoss): {best_fit_2:.4f}, AvgFit: {avg_fit_2:.4f}"
     )
     console.print(
-        f"Second generation created with {len(next_pop_2)} individuals."
-    )
-    console.print(
-        f"Generation 2 - Best Fitness (Neg Loss): {best_fit_2:.4f}, Avg Fitness: {avg_fit_2:.4f}"
-    )
-    if best_state_dict_2:
-        console.print(
-            f"  Best model state dict (gen 2) keys: {list(best_state_dict_2.keys())[:3]}"
-        )
-    console.print(
-        f"Best Offspring Accuracies: Top-1: {best_accs_2.get(1,0):.2f}%, Top-5: {best_accs_2.get(5,0):.2f}%"
+        f"Gen 2 Best Accs: Top-1: {best_accs_2.get(1,0):.2f}%, Top-5: {best_accs_2.get(5,0):.2f}%"
     )
 
     console.rule(

@@ -199,3 +199,5 @@ emnist_data_byclass/*
 emnist_data_letters*
 saved_models/*
 saved_es_models/*
+saved_models_accelerate/*
+saved_es_models_accelerate/*
