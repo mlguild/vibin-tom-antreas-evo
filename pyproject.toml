@@ -1,0 +1,77 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tom_antreas_evolution_vibe_coding"
+version = "0.1.0"
+description = "Exploration of evolution-based optimization methods and related ML tinkering."
+readme = "README.md"
+requires-python = ">=3.9"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License", # Placeholder - choose appropriate license later
+    "Operating System :: OS Independent",
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "torch",
+  "torchvision",
+  "transformers",
+  "python-dotenv",
+  "rich",
+  "vllm", # Note: vLLM might have specific installation requirements depending on CUDA setup
+  "google-genai",
+  "jsonlines",
+  "fire",
+  "tqdm",
+  "datasets",
+  "accelerate",
+  "scikit-learn",
+  "python-dateutil", # Added for date parsing in mapping evaluation
+  "pandas", # Explicitly add pandas if not already assumed by datasets/others
+  "pyarrow", # Required by pandas for parquet
+  "numpy", # Added for median calculations
+  "gputil", # ADDED GPUtil dependency
+  "thop", # ADDED: FLOPs counter
+  "google-cloud-storage", # Explicitly add GCS client
+  "pathlib", # Explicitly adding pathlib, though often a built-in
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=6.0",          # Core testing framework
+    "pytest-xdist",         # For parallel test execution (-n flag)
+    "pytest-mock",          # For mocker fixture (unittest.mock integration)
+]
+develop = [
+    "black>=23.0",          # Code formatter
+    "isort>=5.0",           # Import sorter
+    "ruff",                 # Linter
+    "autoflake",            # ADDED: Unused import/variable remover
+] # Develop dependencies for formatting/linting tools
+
+# [project.urls] # Removed for now to avoid linter errors with empty placeholders
+# "Homepage" = ""
+# "Bug Tracker" = ""
+
+[project.scripts]
+# query-model = "micro_model_inference.cli:main" # Commented out or remove if not relevant
+
+[tool.setuptools]
+packages = ["tinkering"]
+
+# --- Removed Poe the Poet Tasks ---
+# [tool.poe.tasks]
+# format = [...]
+# linter = [...]
+
+# +++ Added PDM Scripts +++
+# [tool.pdm.scripts]
+# format = [...]
+# linter = [...]
+# You can add other scripts here, e.g.:
+# test = "pytest"
+# all = "pdm run format && pdm run linter && pdm run test" 
