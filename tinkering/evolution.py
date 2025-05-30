@@ -30,6 +30,8 @@ def accuracy_metric(
     """Calculates top-k accuracy. Returns a dict {k: accuracy_tensor}."""
     max_k = max(top_k)
     batch_size = labels.size(0)
+    if batch_size == 0:  # Avoid division by zero for empty batches
+        return {k_val: torch.tensor(0.0) for k_val in top_k}
 
     _, pred = outputs.topk(max_k, 1, True, True)
     pred = pred.t()
@@ -63,9 +65,7 @@ def initialize_population(
         model = model_create_fn().to(device)
         # Models are already randomly initialized by PyTorch layers by default
         population.append(model)
-    console.print(
-        f"[info]Initialized population with {population_size} individuals on {device}."
-    )
+    # console.print(f"[info]Initialized population with {population_size} individuals on {device}.")
     return population
 
 
@@ -136,14 +136,24 @@ def get_fitness_evaluation_fn(
             return torch.empty(0, device=device)
 
         inputs, labels = data_batch_tuple
-        inputs, labels = inputs.to(device), labels.to(device)
+        console.print(
+            f"[eval_pop_batch DBG] Input shape: {inputs.shape}, Labels shape: {labels.shape}, Device: {inputs.device}",
+            highlight=False,
+        )
 
         t0 = time.time()
+        # Ensure models are on the correct device before stacking state
+        # This should ideally be handled when population_models_list is created/updated
+        # Forcing it here as an extra check:
+        # population_models_list = [m.to(device) for m in population_models_list]
         stacked_params, stacked_buffers = stack_module_state(
             population_models_list
         )
         params_and_buffers_for_vmap = (stacked_params, stacked_buffers)
-        # console.print(f"[eval_pop_batch DBG] stack_module_state took: {time.time() - t0:.4f}s")
+        console.print(
+            f"[eval_pop_batch DBG] stack_module_state took: {time.time() - t0:.4f}s",
+            highlight=False,
+        )
 
         use_autocast = amp_dtype is not None and device.type == "cuda"
 
@@ -155,14 +165,30 @@ def get_fitness_evaluation_fn(
                 dtype=amp_dtype if use_autocast else torch.float32,
             ):
                 t1 = time.time()
-                # console.print(f"[eval_pop_batch DBG] Calling vmapped_get_outputs. Input device: {inputs.device}")
-                # for p_name, p_val in params_and_buffers_for_vmap[0].items(): # Check a param device from first model
-                #     console.print(f"[eval_pop_batch DBG] Param {p_name} device: {p_val.device}")
-                #     break
+                console.print(
+                    f"[eval_pop_batch DBG] Calling vmapped_get_outputs. Input device: {inputs.device}",
+                    highlight=False,
+                )
+                if params_and_buffers_for_vmap[0]:
+                    first_param_name = next(
+                        iter(params_and_buffers_for_vmap[0]), None
+                    )
+                    if (
+                        first_param_name
+                        and first_param_name in params_and_buffers_for_vmap[0]
+                    ):
+                        console.print(
+                            f"[eval_pop_batch DBG] Param '{first_param_name}' device: {params_and_buffers_for_vmap[0][first_param_name].device}",
+                            highlight=False,
+                        )
+
                 batched_outputs = vmapped_get_outputs(
                     params_and_buffers_for_vmap, inputs
                 )
-                # console.print(f"[eval_pop_batch DBG] vmapped_get_outputs took: {time.time() - t1:.4f}s. Output shape: {batched_outputs.shape}")
+                console.print(
+                    f"[eval_pop_batch DBG] vmapped_get_outputs took: {time.time() - t1:.4f}s. Output shape: {batched_outputs.shape if batched_outputs is not None else 'None'}",
+                    highlight=False,
+                )
 
         t2 = time.time()
         fitness_scores = []
@@ -234,19 +260,25 @@ def run_one_generation(
     Additionally, evaluates accuracy of the best offspring using functional_call.
     """
     gen_start_time = time.time()
-    # console.print(f"[Gen {gen_num} DBG] Starting generation.")
+    console.print(f"[Gen {gen_num} DBG] Starting generation.", highlight=False)
 
     t0 = time.time()
     offspring_population = apply_mutation(
         current_population_models, mutation_strength, device
     )
-    # console.print(f"[Gen {gen_num} DBG] apply_mutation took: {time.time() - t0:.4f}s")
+    console.print(
+        f"[Gen {gen_num} DBG] apply_mutation took: {time.time() - t0:.4f}s, Num offspring: {len(offspring_population)}",
+        highlight=False,
+    )
 
     t1 = time.time()
     offspring_fitness_scores = fitness_eval_fn(
         offspring_population, data_batch_tuple, device
     )
-    # console.print(f"[Gen {gen_num} DBG] fitness_eval_fn took: {time.time() - t1:.4f}s")
+    console.print(
+        f"[Gen {gen_num} DBG] fitness_eval_fn (evaluate_population_on_batch) took: {time.time() - t1:.4f}s",
+        highlight=False,
+    )
 
     best_fitness_this_gen = -float("inf")
     avg_fitness_this_gen = -float("inf")
@@ -283,10 +315,13 @@ def run_one_generation(
         inputs_acc, labels_acc = data_batch_tuple
         inputs_acc, labels_acc = inputs_acc.to(device), labels_acc.to(device)
         use_autocast_acc = amp_dtype is not None and device.type == "cuda"
-        with torch.no_grad(), torch.amp.autocast(
-            device_type=device.type,
-            enabled=use_autocast_acc,
-            dtype=amp_dtype if use_autocast_acc else torch.float32,
+        with (
+            torch.no_grad(),
+            torch.amp.autocast(
+                device_type=device.type,
+                enabled=use_autocast_acc,
+                dtype=amp_dtype if use_autocast_acc else torch.float32,
+            ),
         ):
             outputs_best_offspring = functional_call(
                 base_model_architecture,
@@ -300,7 +335,10 @@ def run_one_generation(
         best_offspring_top_k_accuracies = {
             k: v.item() for k, v in acc_dict_tensors.items()
         }
-    # console.print(f"[Gen {gen_num} DBG] Accuracy eval for best offspring took: {time.time() - t_acc_eval_start:.4f}s")
+    console.print(
+        f"[Gen {gen_num} DBG] Accuracy eval for best offspring took: {time.time() - t_acc_eval_start:.4f}s",
+        highlight=False,
+    )
 
     t_selection_start = time.time()
     num_to_select_for_next_gen = len(current_population_models)
@@ -309,8 +347,14 @@ def run_one_generation(
         offspring_fitness_scores,
         num_to_select_for_next_gen,
     )
-    # console.print(f"[Gen {gen_num} DBG] select_top_n_offspring took: {time.time() - t_selection_start:.4f}s")
-    # console.print(f"[Gen {gen_num} DBG] Total run_one_generation took: {time.time() - gen_start_time:.4f}s")
+    console.print(
+        f"[Gen {gen_num} DBG] select_top_n_offspring took: {time.time() - t_selection_start:.4f}s",
+        highlight=False,
+    )
+    console.print(
+        f"[Gen {gen_num} DBG] Total run_one_generation took: {time.time() - gen_start_time:.4f}s",
+        highlight=False,
+    )
 
     return (
         next_generation_population,
@@ -347,7 +391,8 @@ if __name__ == "__main__":
     #     return -loss  # Negative loss, so higher is better
 
     console.print(
-        f"Test params: pop_size={pop_size_test}, mutation_strength={mutation_strength_test}, fitness=neg_loss, device={device_test}"
+        f"Test params: pop_size={pop_size_test}, mutation_strength={mutation_strength_test}, fitness=neg_loss, device={device_test}",
+        highlight=False,
     )
 
     # 1. Initialize Population
@@ -389,7 +434,10 @@ if __name__ == "__main__":
         top_k_acc_report=(1, 5),
         gen_num=1,  # For debug logs inside
     )
-    console.print(f"run_one_generation (1) took: {time.time() - s_time:.4f}s")
+    console.print(
+        f"run_one_generation (1) took: {time.time() - s_time:.4f}s",
+        highlight=False,
+    )
     console.print(
         f"Next gen: {len(next_pop)} ind. BestFit(NegLoss): {best_fit:.4f}, AvgFit: {avg_fit:.4f}"
     )
@@ -397,7 +445,10 @@ if __name__ == "__main__":
         f"Best Offspring Accs: Top-1: {best_accs.get(1,0):.2f}%, Top-5: {best_accs.get(5,0):.2f}%"
     )
     if best_sd:
-        console.print(f"  Best model SD keys: {list(best_sd.keys())[:3]}")
+        console.print(
+            f"  Best model SD keys: {list(best_sd.keys())[:3]}",
+            highlight=False,
+        )
 
     console.rule("4. Run Second Generation (sanity check)")
     current_pop = next_pop
@@ -414,7 +465,10 @@ if __name__ == "__main__":
         top_k_acc_report=(1, 5),
         gen_num=2,  # For debug logs inside
     )
-    console.print(f"run_one_generation (2) took: {time.time() - s_time:.4f}s")
+    console.print(
+        f"run_one_generation (2) took: {time.time() - s_time:.4f}s",
+        highlight=False,
+    )
     console.print(
         f"Gen 2 - BestFit(NegLoss): {best_fit_2:.4f}, AvgFit: {avg_fit_2:.4f}"
     )
